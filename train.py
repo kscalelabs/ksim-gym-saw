@@ -85,21 +85,17 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
 class VelocityCommand(ksim.Command):
     """Body-frame velocity command with built-in resampling timer."""
 
-    # ──────────────────────────────────────────────────────────
-    CAT_STAND = 0  # [0, 0, 0]
-    CAT_SAGITTAL = 1  # walk ±x
-    CAT_LATERAL = 2  # strafe ±y
-    CAT_ROTATE = 3  # yaw rate
-    CAT_OMNI = 4  # full planar + yaw
-    NUM_CATS = 5
+    categories: tuple[str, ...] = ("stand", "sagittal", "lateral", "rotate", "omni")
+    NUM_CATS: int = len(categories)
     # sampling ranges
     x_range: tuple[float, float] = (-0.5, 2.0)
     y_range: tuple[float, float] = (-0.5, 0.5)
     yaw_range: tuple[float, float] = (-0.5, 0.5)
+
+    # timing
     interval_range: tuple[float, float] = (2.0, 6.0)
     dt: float = attrs.field()
 
-    # ──────────────────────────────────────────────────────────
     @staticmethod
     def to_policy(cmd: jnp.ndarray) -> jnp.ndarray:  # [cx,cy,cyaw]
         return cmd[..., :3]
@@ -114,7 +110,6 @@ class VelocityCommand(ksim.Command):
         return jnp.zeros(4, dtype=jnp.float32)
 
     def _sample_category(self, rng: PRNGKeyArray) -> jnp.ndarray:
-        # int32 works cleanly as an array index inside JAX
         return jax.random.randint(rng, (), 0, self.NUM_CATS, dtype=jnp.int32)
 
     def _sample_cmd(self, cat: jnp.ndarray, rng: PRNGKeyArray) -> jnp.ndarray:
@@ -140,7 +135,6 @@ class VelocityCommand(ksim.Command):
         # `cat` is the integer index selecting the row we want.
         return cmd_table[cat]
 
-    # ──────────────────────────────────────────────────────────
     def __call__(
         self,
         prev_command: jnp.ndarray,  # (4,)
