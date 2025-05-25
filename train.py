@@ -153,6 +153,25 @@ class StraightLegPenalty(JointPositionPenalty):
         )
 
 
+@attrs.define(frozen=True, kw_only=True)
+class ActionRatePenalty(ksim.Reward):
+    """Penalty for large per-timestep changes in the action vector (a_t - a_{t-1})."""
+
+    norm: xax.NormType = attrs.field(default="l2", validator=ksim.utils.validators.norm_validator)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        actions = trajectory.action                                # (T, dim)
+        # Pad one step at the front so we can take a first difference.
+        actions_zp = jnp.pad(actions, ((1, 0), (0, 0)), mode="edge")
+        # Mask out steps immediately following termination.
+        done = jnp.pad(trajectory.done[..., :-1], ((1, 0),), mode="edge")[..., None]
+
+        action_rate = jnp.where(done, 0.0, actions_zp[..., 1:, :] - actions_zp[..., :-1, :])
+        # Mean over action dimensions; choose your favourite norm (l1/l2 etc.).
+        penalty = xax.get_norm(action_rate, self.norm).mean(axis=-1)
+        return penalty
+
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
@@ -452,6 +471,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
             ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
+            ActionRatePenalty(scale=-0.1, scale_by_curriculum=True),
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
         ]
