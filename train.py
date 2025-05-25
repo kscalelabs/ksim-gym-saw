@@ -392,19 +392,19 @@ class FollowVelocityReward(ksim.Reward):
 
 # I cant get tensorboard to log 3 different graphs if I directly call FollowVelocityReward.
 @attrs.define(frozen=True, kw_only=True)
-class FollowVelocityRewardX(FollowVelocityReward):
+class FollowVelocityXReward(FollowVelocityReward):
     """Track commanded forward (x) velocity."""
 
     component: str = attrs.field(default="x", init=False)
 
 @attrs.define(frozen=True, kw_only=True)
-class FollowVelocityRewardY(FollowVelocityReward):
+class FollowVelocityYReward(FollowVelocityReward):
     """Track commanded lateral (y) velocity."""
 
     component: str = attrs.field(default="y", init=False)
 
 @attrs.define(frozen=True, kw_only=True)
-class FollowVelocityRewardYaw(FollowVelocityReward):
+class FollowVelocityYawReward(FollowVelocityReward):
     """Track commanded yaw rate."""
 
     component: str = attrs.field(default="z", init=False)
@@ -712,9 +712,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
             # === Command-following rewards ===
-            FollowVelocityRewardX(scale=0.15),
-            FollowVelocityRewardY(scale=0.15),
-            FollowVelocityRewardYaw(scale=0.1),
+            FollowVelocityXReward(scale=0.15),
+            FollowVelocityYReward(scale=0.15),
+            FollowVelocityYawReward(scale=0.1),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
