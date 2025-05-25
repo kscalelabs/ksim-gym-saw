@@ -342,6 +342,74 @@ class ActionRatePenalty(ksim.Reward):
         return penalty
 
 
+@attrs.define(frozen=True, kw_only=True)
+class FollowVelocityReward(ksim.Reward):
+    """Reward for tracking the commanded body-frame velocity/rotation.
+
+    The reward is computed for a single component (x, y, or yaw). First
+    convert the robot linear / angular velocity to the body frame and then
+    penalise the squared error to the corresponding commanded value using an
+    exponential kernel:
+        r = exp(-error_scale * (v - v_cmd)^2)
+    """
+
+    component: str = attrs.field(validator=attrs.validators.in_({"x", "y", "z"}))
+    """Which component to track:  ``'x'`` → forward velocity, ``'y'`` → lateral
+    velocity, ``'z'`` (treated as yaw) → yaw angular velocity."""
+    error_scale: float = attrs.field(default=5.0)
+    command_name: str = attrs.field(default="velocity_command")
+
+    def _linear_velocity_body(self, traj: ksim.Trajectory) -> Array:
+        linvel_world = traj.qvel[..., :3]
+        linvel_body = xax.rotate_vector_by_quat(linvel_world, traj.qpos[..., 3:7], inverse=True)
+        return linvel_body
+
+    def _angular_velocity_body(self, traj: ksim.Trajectory) -> Array:
+        angvel_world = traj.qvel[..., 3:6]
+        angvel_body = xax.rotate_vector_by_quat(angvel_world, traj.qpos[..., 3:7], inverse=True)
+        return angvel_body
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        cmd = trajectory.command[self.command_name][..., :3]  # shape (..., 3) [cx, cy, cyaw]
+
+        if self.component == "x":
+            vel_body = self._linear_velocity_body(trajectory)[..., 0]
+            cmd_val = cmd[..., 0]
+        elif self.component == "y":
+            vel_body = self._linear_velocity_body(trajectory)[..., 1]
+            cmd_val = cmd[..., 1]
+        else:  # "z" → yaw rate around Z
+            vel_body = self._angular_velocity_body(trajectory)[..., 2]
+            cmd_val = cmd[..., 2]
+
+        error = vel_body - cmd_val
+        return jnp.exp(-self.error_scale * jnp.square(error))
+
+    # Provide a more descriptive metric name for logging.
+    def get_name(self) -> str:
+        comp_name = {"x": "follow_instructed_x", "y": "follow_instructed_y", "z": "follow_instructed_yaw"}[self.component]
+        return comp_name
+
+# I cant get tensorboard to log 3 different graphs if I directly call FollowVelocityReward.
+@attrs.define(frozen=True, kw_only=True)
+class FollowVelocityRewardX(FollowVelocityReward):
+    """Track commanded forward (x) velocity."""
+
+    component: str = attrs.field(default="x", init=False)
+
+@attrs.define(frozen=True, kw_only=True)
+class FollowVelocityRewardY(FollowVelocityReward):
+    """Track commanded lateral (y) velocity."""
+
+    component: str = attrs.field(default="y", init=False)
+
+@attrs.define(frozen=True, kw_only=True)
+class FollowVelocityRewardYaw(FollowVelocityReward):
+    """Track commanded yaw rate."""
+
+    component: str = attrs.field(default="z", init=False)
+
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
@@ -643,6 +711,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             # Bespoke rewards.
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
+            # === Command-following rewards ===
+            FollowVelocityRewardX(scale=0.15),
+            FollowVelocityRewardY(scale=0.15),
+            FollowVelocityRewardYaw(scale=0.1),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
