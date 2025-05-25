@@ -82,6 +82,89 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
 
 
 @attrs.define(frozen=True, kw_only=True)
+class VelocityCommand(ksim.Command):
+    """Body-frame velocity command with built-in resampling timer."""
+
+    # ──────────────────────────────────────────────────────────
+    CAT_STAND = 0  # [0, 0, 0]
+    CAT_SAGITTAL = 1  # walk ±x
+    CAT_LATERAL = 2  # strafe ±y
+    CAT_ROTATE = 3  # yaw rate
+    CAT_OMNI = 4  # full planar + yaw
+    NUM_CATS = 5
+    # sampling ranges
+    x_range: tuple[float, float] = (-0.5, 2.0)
+    y_range: tuple[float, float] = (-0.5, 0.5)
+    yaw_range: tuple[float, float] = (-0.5, 0.5)
+    interval_range: tuple[float, float] = (2.0, 6.0)
+    dt: float = attrs.field()
+
+    # ──────────────────────────────────────────────────────────
+    @staticmethod
+    def to_policy(cmd: jnp.ndarray) -> jnp.ndarray:  # [cx,cy,cyaw]
+        return cmd[..., :3]
+
+    def initial_command(
+        self,
+        _physics_data: ksim.PhysicsData,
+        _curriculum_level: Array,
+        _rng: PRNGKeyArray,
+    ) -> jnp.ndarray:
+        """Start with zeros so the first step triggers a resample."""
+        return jnp.zeros(4, dtype=jnp.float32)
+
+    def _sample_category(self, rng: PRNGKeyArray) -> jnp.ndarray:
+        # int32 works cleanly as an array index inside JAX
+        return jax.random.randint(rng, (), 0, self.NUM_CATS, dtype=jnp.int32)
+
+    def _sample_cmd(self, cat: jnp.ndarray, rng: PRNGKeyArray) -> jnp.ndarray:
+        """Sample ``[cx, cy, cyaw]`` according to the motion category."""
+        rng_x, rng_y, rng_yaw = jax.random.split(rng, 3)
+
+        # Draw one value for each axis (they may or may not be used).
+        cx = jax.random.uniform(rng_x, (), minval=self.x_range[0], maxval=self.x_range[1])
+        cy = jax.random.uniform(rng_y, (), minval=self.y_range[0], maxval=self.y_range[1])
+        wz = jax.random.uniform(rng_yaw, (), minval=self.yaw_range[0], maxval=self.yaw_range[1])
+
+        # Command table: shape (5, 3)
+        cmd_table = jnp.stack(
+            [
+                jnp.array([0.0, 0.0, 0.0]),  # stand
+                jnp.array([cx, 0.0, 0.0]),  # sagittal walk
+                jnp.array([0.0, cy, 0.0]),  # lateral walk
+                jnp.array([0.0, 0.0, wz]),  # rotate in place
+                jnp.array([cx, cy, wz]),  # omnidirectional
+            ]
+        )
+
+        # `cat` is the integer index selecting the row we want.
+        return cmd_table[cat]
+
+    # ──────────────────────────────────────────────────────────
+    def __call__(
+        self,
+        prev_command: jnp.ndarray,  # (4,)
+        _physics_data: ksim.PhysicsData,
+        _curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> jnp.ndarray:
+        cmd_prev, steps_left = prev_command[:3], prev_command[3] - 1.0
+
+        def resample(_: None) -> jnp.ndarray:
+            rng_cat, rng_cmd, rng_int = jax.random.split(rng, 3)
+            cat = self._sample_category(rng_cat)
+            cmd_vec = self._sample_cmd(cat, rng_cmd)  # (3,)
+            secs = jax.random.uniform(rng_int, (), minval=self.interval_range[0], maxval=self.interval_range[1])
+            new_steps = jnp.maximum(jnp.round(secs / self.dt), 1.0)
+            return jnp.concatenate([cmd_vec, new_steps[None]], axis=0)
+
+        def keep(_: None) -> jnp.ndarray:
+            return jnp.concatenate([cmd_prev, steps_left[None]], axis=0)
+
+        return jax.lax.cond(steps_left <= 0.0, resample, keep, operand=None)
+
+
+@attrs.define(frozen=True, kw_only=True)
 class JointPositionPenalty(ksim.JointDeviationPenalty):
     @classmethod
     def create_from_names(
@@ -160,7 +243,7 @@ class ActionRatePenalty(ksim.Reward):
     norm: xax.NormType = attrs.field(default="l2", validator=ksim.utils.validators.norm_validator)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
-        actions = trajectory.action                                # (T, dim)
+        actions = trajectory.action  # (T, dim)
         # Pad one step at the front so we can take a first difference.
         actions_zp = jnp.pad(actions, ((1, 0), (0, 0)), mode="edge")
         # Mask out steps immediately following termination.
@@ -451,27 +534,26 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         ]
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        return []
+        return [VelocityCommand(dt=self.config.dt)]
 
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             # Standard rewards.
             ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
             ksim.NaiveForwardOrientationReward(scale=1.0),
-            ksim.StayAliveReward(scale=1.0),
+            # ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=0.5),
             # Avoid movement penalties.
-            ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
-            ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
+            # ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
+            # ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
             # Normalization penalties.
-            ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
+            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
-            ActionRatePenalty(scale=-0.1, scale_by_curriculum=True),
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
         ]
@@ -490,9 +572,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         return Model(
             key,
-            num_actor_inputs=51 if self.config.use_acc_gyro else 45,
+            num_actor_inputs=54 if self.config.use_acc_gyro else 48,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=446,
+            num_critic_inputs=449,
             min_std=0.001,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -514,6 +596,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
+        vel_cmd_3 = VelocityCommand.to_policy(commands["velocity_command"])
 
         obs = [
             jnp.sin(time_1),
@@ -521,6 +604,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
+            vel_cmd_3,  # 3
         ]
         if self.config.use_acc_gyro:
             obs += [
@@ -551,6 +635,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
+        vel_cmd_3 = VelocityCommand.to_policy(commands["velocity_command"])
 
         obs_n = jnp.concatenate(
             [
@@ -566,6 +651,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
+                vel_cmd_3,  # 3
             ],
             axis=-1,
         )
