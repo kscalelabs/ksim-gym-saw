@@ -340,77 +340,103 @@ class ActionRatePenalty(ksim.Reward):
         return penalty
 
 
+# === New combined XY velocity + yaw orientation rewards ===
 @attrs.define(frozen=True, kw_only=True)
-class FollowVelocityReward(ksim.Reward):
-    """Reward for tracking the commanded body-frame velocity/rotation.
+class FollowVelocityXYReward(ksim.Reward):
+    """Reward for tracking the commanded body-frame linear velocity in the X-Y plane.
 
-    The reward is computed for a single component (x, y, or yaw). First
-    convert the robot linear / angular velocity to the body frame and then
-    penalise the squared error to the corresponding commanded value using an
-    exponential kernel:
-        r = exp(-error_scale * (v - v_cmd)^2)
+    Implements the command-following reward proposed in *"Revisiting Reward Design
+    and Evaluation for Robust Humanoid Standing and Walking"* (2024).
+
+    * During standing (commanded X-Y velocity ≈ 0), an ``exp(-k · |e|)`` kernel is
+      used where ``e = ||v_xy - v_cmd_xy||₁``.
+    * During walking, an ``exp(-k · ||e||²)`` kernel is used where ``e`` is the
+      Euclidean error in the X-Y plane.
     """
 
-    component: str = attrs.field(validator=attrs.validators.in_({"x", "y", "z"}))
-    """Which component to track:  ``'x'`` → forward velocity, ``'y'`` → lateral
-    velocity, ``'z'`` (treated as yaw) → yaw angular velocity."""
     error_scale: float = attrs.field(default=5.0)
+    """`k` in the equations above."""
     command_name: str = attrs.field(default="velocity_command")
+    standing_thresh: float = attrs.field(default=1e-4)
 
+    # ----------------------------------------------------------------------------------
     def _linear_velocity_body(self, traj: ksim.Trajectory) -> Array:
         linvel_world = traj.qvel[..., :3]
         linvel_body = xax.rotate_vector_by_quat(linvel_world, traj.qpos[..., 3:7], inverse=True)
-        return linvel_body
+        return linvel_body[..., :2]  # X, Y components only
 
-    def _angular_velocity_body(self, traj: ksim.Trajectory) -> Array:
-        angvel_world = traj.qvel[..., 3:6]
-        angvel_body = xax.rotate_vector_by_quat(angvel_world, traj.qpos[..., 3:7], inverse=True)
-        return angvel_body
-
+    # ----------------------------------------------------------------------------------
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
-        cmd = trajectory.command[self.command_name][..., :3]  # shape (..., 3) [cx, cy, cyaw]
+        cmd_xy = trajectory.command[self.command_name][..., :2]  # (cx, cy)
+        vel_xy_body = self._linear_velocity_body(trajectory)  # (vx, vy) in body frame
 
-        if self.component == "x":
-            vel_body = self._linear_velocity_body(trajectory)[..., 0]
-            cmd_val = cmd[..., 0]
-        elif self.component == "y":
-            vel_body = self._linear_velocity_body(trajectory)[..., 1]
-            cmd_val = cmd[..., 1]
-        else:  # "z" → yaw rate around Z
-            vel_body = self._angular_velocity_body(trajectory)[..., 2]
-            cmd_val = cmd[..., 2]
+        # Error between commanded and actual velocity in the X-Y plane.
+        err_xy = vel_xy_body - cmd_xy
 
-        error = vel_body - cmd_val
-        return jnp.exp(-self.error_scale * jnp.square(error))
+        # Detect the *standing* case – no commanded motion in X & Y.
+        is_standing = jnp.logical_and(
+            jnp.abs(cmd_xy[..., 0]) < self.standing_thresh, jnp.abs(cmd_xy[..., 1]) < self.standing_thresh
+        )
 
-    # Provide a more descriptive metric name for logging.
+        # l1 like error for standing, l2 for walking.
+        err_norm_l1 = jnp.abs(err_xy).sum(axis=-1)
+        err_norm_l2 = jnp.linalg.norm(err_xy, axis=-1)
+
+        reward_standing = jnp.exp(-self.error_scale * err_norm_l1)
+        reward_walking = jnp.exp(-self.error_scale * jnp.square(err_norm_l2))
+
+        return jnp.where(is_standing, reward_standing, reward_walking)
+
+    # ----------------------------------------------------------------------------------
     def get_name(self) -> str:
-        comp_name = {"x": "follow_instructed_x", "y": "follow_instructed_y", "z": "follow_instructed_yaw"}[
-            self.component
-        ]
-        return comp_name
-
-
-# I cant get tensorboard to log 3 different graphs if I directly call FollowVelocityReward.
-@attrs.define(frozen=True, kw_only=True)
-class FollowVelocityXReward(FollowVelocityReward):
-    """Track commanded forward (x) velocity."""
-
-    component: str = attrs.field(default="x", init=False)
+        return "follow_instructed_xy"
 
 
 @attrs.define(frozen=True, kw_only=True)
-class FollowVelocityYReward(FollowVelocityReward):
-    """Track commanded lateral (y) velocity."""
+class FollowYawOrientationReward(ksim.Reward):
+    """Reward for aligning the base yaw orientation with the commanded yaw angle.
 
-    component: str = attrs.field(default="y", init=False)
+    Uses an exponential of the quaternion distance between the robot's current
+    orientation and the target yaw orientation derived from the command.
+    Eq. ``r = exp(-k · qd(q_current, q_cmd))`` where ``qd`` returns the angle in
+    radians between the two orientations.  Default ``k = 300`` as suggested in
+    the referenced work.
+    """
 
+    error_scale: float = attrs.field(default=5.0)
+    command_name: str = attrs.field(default="velocity_command")
 
-@attrs.define(frozen=True, kw_only=True)
-class FollowVelocityYawReward(FollowVelocityReward):
-    """Track commanded yaw rate."""
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _yaw_from_quat(q: Array) -> Array:  # q shape (..., 4) [w, x, y, z]
+        w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+        return jnp.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
-    component: str = attrs.field(default="z", init=False)
+    @staticmethod
+    def _angle_diff(a: Array, b: Array) -> Array:
+        diff = a - b
+        return jnp.mod(diff + jnp.pi, 2.0 * jnp.pi) - jnp.pi
+
+    # ----------------------------------------------------------------------------------
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        # Extract current yaw from full base orientation quaternion.
+        base_quat = trajectory.qpos[..., 3:7]
+        yaw_curr = self._yaw_from_quat(base_quat)
+
+        # Commanded yaw angle (interpret third component directly as yaw).
+        yaw_cmd = trajectory.command[self.command_name][..., 2]
+
+        # Smallest signed difference.
+        yaw_err = self._angle_diff(yaw_curr, yaw_cmd)
+
+        # Quaternion distance for a pure yaw rotation is |yaw_err| / 2 mapped to sin? but proportional to angle.
+        qd = jnp.abs(yaw_err)
+
+        return jnp.exp(-self.error_scale * qd)
+
+    # ----------------------------------------------------------------------------------
+    def get_name(self) -> str:
+        return "follow_instructed_yaw_ori"
 
 
 class Actor(eqx.Module):
@@ -644,11 +670,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 x_linvel=1.0,
                 y_linvel=1.0,
                 z_linvel=0.3,
-                vel_range=(0.5, 1.0),
+                vel_range=(0.5, 1.5),
                 x_angvel=0.0,
                 y_angvel=0.0,
                 z_angvel=0.0,
-                interval_range=(0.5, 4.0),
+                interval_range=(0.5, 3.0),
             ),
         ]
 
@@ -696,28 +722,15 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
-            # Standard rewards.
-            ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
-            # ksim.StayAliveReward(scale=1.0),
+            # === Standard rewards ===
+            # ksimStayAliveReward(scale=1.0),
             ksim.UprightReward(scale=0.5),
-            # Avoid movement penalties.
-            # ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
-            # ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
-            # Normalization penalties.
-            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # Bespoke rewards.
+            # === Bespoke rewards === #
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
             # === Command-following rewards ===
-            FollowVelocityXReward(scale=0.15),
-            FollowVelocityYReward(scale=0.15),
-            FollowVelocityYawReward(scale=0.1),
+            FollowVelocityXYReward(scale=0.15),
+            FollowYawOrientationReward(scale=0.1),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -908,8 +921,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=4,
-            batch_size=2,
+            num_envs=2048,
+            batch_size=256,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
