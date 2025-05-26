@@ -4,7 +4,7 @@ import asyncio
 import functools
 import math
 from dataclasses import dataclass
-from typing import Self
+from typing import Collection, Self
 
 import attrs
 import distrax
@@ -79,6 +79,93 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         value=1e-5,
         help="Weight decay for the Adam optimizer.",
     )
+
+@attrs.define(kw_only=True)
+class VelocityCommandMarker(ksim.vis.Marker):
+    """Visualize velocity commands with different colors and shapes for each movement category.
+
+    LEGEND:
+    - Stand still: Gray circle (sphere)
+    - Sagittal (forward/backward): Green arrow pointing forward/backward relative to robot
+    - Lateral (sideways): Blue arrow pointing left/right relative to robot
+    - Rotate: Red arrow pointing up/down (clockwise/counterclockwise rotation)
+    - Omni (combined movement): Black arrow in the direction of combined velocity
+    """
+
+    command_name: str = attrs.field()
+    radius: float = attrs.field(default=0.08)
+    size: float = attrs.field(default=0.04)
+    arrow_len: float = attrs.field(default=0.3)
+    height: float = attrs.field(default=0.6)
+
+    def update(self, trajectory: ksim.Trajectory) -> None:
+        cmd = trajectory.command[self.command_name]  # [cx, cy, cyaw, steps_left]
+        cx, cy, cyaw = float(cmd[0]), float(cmd[1]), float(cmd[2])
+
+        self.pos = (0.0, 0.0, self.height)
+
+        # Determine movement category based on which components are non-zero
+        has_x = abs(cx) > 1e-4
+        has_y = abs(cy) > 1e-4
+        has_yaw = abs(cyaw) > 1e-4
+
+        if not (has_x or has_y or has_yaw):
+            # Stand still: Gray circle
+            self.geom = mujoco.mjtGeom.mjGEOM_SPHERE
+            self.scale = (self.radius, self.radius, self.radius)
+            self.rgba = (0.7, 0.7, 0.7, 0.8)
+
+        elif has_x and not has_y and not has_yaw:
+            # Sagittal (forward/backward): Green arrow
+            self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+            direction = (1.0 if cx > 0 else -1.0, 0.0, 0.0)
+            self.scale = (self.size, self.size, self.arrow_len * abs(cx))
+            self.orientation = self.quat_from_direction(direction)
+            self.rgba = (0.2, 0.8, 0.2, 0.8)  # Green
+
+        elif has_y and not has_x and not has_yaw:
+            # Lateral (sideways): Blue arrow
+            self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+            direction = (0.0, 1.0 if cy > 0 else -1.0, 0.0)
+            self.scale = (self.size, self.size, self.arrow_len * abs(cy))
+            self.orientation = self.quat_from_direction(direction)
+            self.rgba = (0.2, 0.2, 0.8, 0.8)  # Blue
+
+        elif has_yaw and not has_x and not has_y:
+            # Rotate: Red arrow pointing up/down
+            self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+            direction = (0.0, 0.0, 1.0 if cyaw > 0 else -1.0)
+            self.scale = (self.size, self.size, self.arrow_len * abs(cyaw))
+            self.orientation = self.quat_from_direction(direction)
+            self.rgba = (0.8, 0.2, 0.2, 0.8)  # Red
+
+        else:
+            # Omni (combined movement): Black arrow in direction of combined velocity
+            self.geom = mujoco.mjtGeom.mjGEOM_ARROW
+            # For combined movement, use the linear velocity direction
+            if has_x or has_y:
+                magnitude = math.sqrt(cx * cx + cy * cy)
+                direction = (cx / magnitude if magnitude > 0 else 1.0, cy / magnitude if magnitude > 0 else 0.0, 0.0)
+                self.scale = (self.size, self.size, self.arrow_len * magnitude)
+            else:
+                # Only rotation, use up/down
+                direction = (0.0, 0.0, 1.0 if cyaw > 0 else -1.0)
+                self.scale = (self.size, self.size, self.arrow_len * abs(cyaw))
+
+            self.orientation = self.quat_from_direction(direction)
+            self.rgba = (0.1, 0.1, 0.1, 0.8)  # Black
+
+    @classmethod
+    def get(cls, command_name: str, *, height: float = 0.6) -> Self:
+        return cls(
+            command_name=command_name,
+            target_type="root",
+            geom=mujoco.mjtGeom.mjGEOM_SPHERE,
+            scale=(0.0, 0.0, 0.0),
+            height=height,
+            track_rotation=True,
+        )
+    
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -156,6 +243,10 @@ class VelocityCommand(ksim.Command):
             return jnp.concatenate([cmd_prev, steps_left[None]], axis=0)
 
         return jax.lax.cond(steps_left <= 0.0, resample, keep, operand=None)
+
+    def get_markers(self) -> Collection[ksim.vis.Marker]:
+        """Get the visualization markers for this command."""
+        return [VelocityCommandMarker.get(self.command_name)]
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -740,8 +831,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=2048,
-            batch_size=256,
+            num_envs=8,
+            batch_size=2,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
@@ -755,6 +846,7 @@ if __name__ == "__main__":
             drop_action_prob=0.05,  # Drop 5% of commands.
             # Visualization parameters.
             render_track_body_id=0,
+            render_markers=True,
             # Checkpointing parameters.
             save_every_n_seconds=60,
         ),
