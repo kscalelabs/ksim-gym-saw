@@ -394,49 +394,46 @@ class FollowVelocityXYReward(ksim.Reward):
 
 @attrs.define(frozen=True, kw_only=True)
 class FollowYawOrientationReward(ksim.Reward):
-    """Reward for aligning the base yaw orientation with the commanded yaw angle.
+    """Reward for tracking the commanded yaw angular velocity (yaw rate).
 
-    Uses an exponential of the quaternion distance between the robot's current
-    orientation and the target yaw orientation derived from the command.
-    Eq. ``r = exp(-k · qd(q_current, q_cmd))`` where ``qd`` returns the angle in
-    radians between the two orientations.  Default ``k = 300`` as suggested in
-    the referenced work.
+    Uses an exponential penalty on the error between the robot's current yaw
+    angular velocity and the commanded yaw rate. This is consistent with the
+    velocity-based nature of the X-Y commands.
     """
+
+    print("skibbidi bop bop")
 
     error_scale: float = attrs.field(default=5.0)
     command_name: str = attrs.field(default="velocity_command")
 
     # ----------------------------------------------------------------------------------
-    @staticmethod
-    def _yaw_from_quat(q: Array) -> Array:  # q shape (..., 4) [w, x, y, z]
-        w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-        return jnp.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-    @staticmethod
-    def _angle_diff(a: Array, b: Array) -> Array:
-        diff = a - b
-        return jnp.mod(diff + jnp.pi, 2.0 * jnp.pi) - jnp.pi
+    def _angular_velocity_body(self, traj: ksim.Trajectory) -> Array:
+        angvel_world = traj.qvel[..., 3:6]
+        angvel_body = xax.rotate_vector_by_quat(angvel_world, traj.qpos[..., 3:7], inverse=True)
+        return angvel_body
 
     # ----------------------------------------------------------------------------------
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
-        # Extract current yaw from full base orientation quaternion.
-        base_quat = trajectory.qpos[..., 3:7]
-        yaw_curr = self._yaw_from_quat(base_quat)
+        # Current yaw angular velocity in body frame
+        yaw_rate_curr = self._angular_velocity_body(trajectory)[..., 2]
 
-        # Commanded yaw angle (interpret third component directly as yaw).
-        yaw_cmd = trajectory.command[self.command_name][..., 2]
+        print("yaw_rate_curr: ", yaw_rate_curr)
 
-        # Smallest signed difference.
-        yaw_err = self._angle_diff(yaw_curr, yaw_cmd)
+        # Commanded yaw rate (third component is yaw angular velocity)
+        yaw_rate_cmd = trajectory.command[self.command_name][..., 2]
 
-        # Quaternion distance for a pure yaw rotation is |yaw_err| / 2 mapped to sin? but proportional to angle.
-        qd = jnp.abs(yaw_err)
+        print("yaw_rate_cmd: ", yaw_rate_cmd)
 
-        return jnp.exp(-self.error_scale * qd)
+        # Error between commanded and actual yaw rate
+        yaw_rate_error = yaw_rate_curr - yaw_rate_cmd
+
+        print("current error: ", yaw_rate_error)
+
+        return jnp.exp(-self.error_scale * jnp.square(yaw_rate_error))
 
     # ----------------------------------------------------------------------------------
     def get_name(self) -> str:
-        return "follow_instructed_yaw_ori"
+        return "follow_instructed_yaw_rate"
 
 
 class Actor(eqx.Module):
