@@ -80,6 +80,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="Weight decay for the Adam optimizer.",
     )
 
+
 @attrs.define(kw_only=True)
 class VelocityCommandMarker(ksim.vis.Marker):
     """Visualize velocity commands with different colors and shapes for each movement category.
@@ -165,7 +166,6 @@ class VelocityCommandMarker(ksim.vis.Marker):
             height=height,
             track_rotation=True,
         )
-    
 
 
 @attrs.define(frozen=True, kw_only=True)
