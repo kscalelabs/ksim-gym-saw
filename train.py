@@ -698,11 +698,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         )
 
     def get_mujoco_model(self) -> mujoco.MjModel:
-        mjcf_path = asyncio.run(ksim.get_mujoco_model_path("kbot", name="robot"))
+        mjcf_path = asyncio.run(ksim.get_mujoco_model_path("kbot-headless", name="robot"))
         return mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
 
     def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> ksim.Metadata:
-        metadata = asyncio.run(ksim.get_mujoco_model_metadata("kbot"))
+        metadata = asyncio.run(ksim.get_mujoco_model_metadata("kbot-headless"))
         if metadata.joint_name_to_metadata is None:
             raise ValueError("Joint metadata is not available")
         if metadata.actuator_type_to_metadata is None:
@@ -827,7 +827,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             key,
             num_actor_inputs=54 if self.config.use_acc_gyro else 48,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=451, 
+            num_critic_inputs=453, 
             min_std=0.001,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -905,7 +905,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
-                feet_contact_2,  # 2
+                feet_contact_2.flatten(),  # 4 there is probably a better way to do this 
                 vel_cmd_3,  # 3
             ],
             axis=-1,
@@ -1002,7 +1002,7 @@ if __name__ == "__main__":
         HumanoidWalkingTaskConfig(
             # Training parameters.
             num_envs=2048,
-            batch_size=256,
+            batch_size=512,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
