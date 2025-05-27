@@ -401,8 +401,6 @@ class FollowYawOrientationReward(ksim.Reward):
     velocity-based nature of the X-Y commands.
     """
 
-    print("skibbidi bop bop")
-
     error_scale: float = attrs.field(default=5.0)
     command_name: str = attrs.field(default="velocity_command")
 
@@ -417,23 +415,93 @@ class FollowYawOrientationReward(ksim.Reward):
         # Current yaw angular velocity in body frame
         yaw_rate_curr = self._angular_velocity_body(trajectory)[..., 2]
 
-        print("yaw_rate_curr: ", yaw_rate_curr)
-
         # Commanded yaw rate (third component is yaw angular velocity)
         yaw_rate_cmd = trajectory.command[self.command_name][..., 2]
 
-        print("yaw_rate_cmd: ", yaw_rate_cmd)
-
         # Error between commanded and actual yaw rate
         yaw_rate_error = yaw_rate_curr - yaw_rate_cmd
-
-        print("current error: ", yaw_rate_error)
 
         return jnp.exp(-self.error_scale * jnp.square(yaw_rate_error))
 
     # ----------------------------------------------------------------------------------
     def get_name(self) -> str:
         return "follow_instructed_yaw_rate"
+
+# after only specifying being upright, x, y and yaw following, the robot develops this hopping nature
+# adding a foot contact reward. 1 if the controller instructs standing. 
+@attrs.define(frozen=True, kw_only=True)
+class FootContactReward(ksim.Reward):
+    """
+    If standing (command is 0, 0, 0) reward is 1 always
+    If not standing, if there is a single foot in contact, reward is 1
+    If not standing, if there was a single foot contact period 0.2 seconds ago, reward is 1
+    Else, reward is 0
+    """
+
+    command_name: str = attrs.field(default="velocity_command")
+    feet_contact_obs_name: str = attrs.field(default="feet_contact_observation")
+    standing_thresh: float = attrs.field(default=1e-4)
+    contact_memory_duration: float = attrs.field(default=0.2)  # 0.2 seconds
+    ctrl_dt: float = attrs.field(default=0.02)  # control timestep
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Get commanded velocity [cx, cy, cyaw] for each timestep and determine if we are standing.
+        cmd_xyz = trajectory.command[self.command_name][..., :3]  # (..., 3)
+        is_standing = jnp.linalg.norm(cmd_xyz, axis=-1) < self.standing_thresh  # (...,)
+
+        # ---------------------------------------------------------------------
+        # Foot contact processing
+        # `foot_contact` has shape (..., 2, 2) where the last two dimensions are
+        #   - foot index   (0 = left, 1 = right)
+        #   - capsule index (two collision capsules per foot)
+        # We consider a foot "in contact" if **any** of its capsules touch the
+        # floor at that timestep.
+        # ---------------------------------------------------------------------
+        foot_contact = trajectory.obs[self.feet_contact_obs_name]  # (..., 2, 2)
+        contact_bool = foot_contact > 0.5  # convert to boolean
+        left_contact = jnp.any(contact_bool[..., 0, :], axis=-1)   # (...,)
+        right_contact = jnp.any(contact_bool[..., 1, :], axis=-1)  # (...,)
+
+        # Single-support: exactly one foot in contact.
+        single_support = jnp.logical_xor(left_contact, right_contact)  # (...,)
+
+        # ------------------------------------------------------------------
+        # Recent single-support memory mask (<= 0.2 s ago).
+        # We scan over the time dimension and track how many steps have passed
+        # since the last single-support event.
+        # ------------------------------------------------------------------
+        memory_steps = int(self.contact_memory_duration / self.ctrl_dt)
+
+        def _recent_mask(seq_1d: Array) -> Array:
+            """Return a boolean mask with True if a single-support event
+            occurred ≤ `memory_steps` timesteps ago."""
+            def body(steps_since, event):
+                steps_since = jnp.where(event, 0, steps_since + 1)
+                return steps_since, steps_since <= memory_steps
+
+            _, mask = jax.lax.scan(body, memory_steps + 1, seq_1d)
+            return mask
+
+        recent_single = (
+            jax.vmap(_recent_mask)(single_support)
+            if single_support.ndim == 2  # batched trajectories
+            else _recent_mask(single_support)
+        )
+
+        # ------------------------------------------------------------------
+        # Reward logic
+        #   1. Standing = 1
+        #   2. Current single support = 1
+        #   3. Recent single support = 1
+        #   4. Otherwise = 0
+        # ------------------------------------------------------------------
+        reward = jnp.where(
+            is_standing,
+            1.0,
+            jnp.where(single_support | recent_single, 1.0, 0.0),
+        )
+
+        return reward
 
 
 class Actor(eqx.Module):
@@ -712,6 +780,19 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 sensor_name="imu_gyro",
                 noise=math.radians(10),
             ),
+            ksim.FeetContactObservation.create(
+                physics_model=physics_model,
+                foot_left_geom_names=(
+                    "KB_D_501L_L_LEG_FOOT_collision_capsule_0",
+                    "KB_D_501L_L_LEG_FOOT_collision_capsule_1",
+                ),
+                foot_right_geom_names=(
+                    "KB_D_501R_R_LEG_FOOT_collision_capsule_0",
+                    "KB_D_501R_R_LEG_FOOT_collision_capsule_1",
+                ),
+                floor_geom_names="floor",
+                noise=0.0,
+            ),
         ]
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
@@ -724,10 +805,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.UprightReward(scale=0.5),
             # === Bespoke rewards === #
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
             # === Command-following rewards ===
             FollowVelocityXYReward(scale=0.15),
             FollowYawOrientationReward(scale=0.1),
+            FootContactReward(scale=0.1),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -746,7 +827,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             key,
             num_actor_inputs=54 if self.config.use_acc_gyro else 48,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=449,
+            num_critic_inputs=451, 
             min_std=0.001,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -807,6 +888,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
+        feet_contact_2 = observations["feet_contact_observation"]
         vel_cmd_3 = VelocityCommand.to_policy(commands["velocity_command"])
 
         obs_n = jnp.concatenate(
@@ -823,6 +905,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
+                feet_contact_2,  # 2
                 vel_cmd_3,  # 3
             ],
             axis=-1,
