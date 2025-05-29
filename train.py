@@ -54,7 +54,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="The hidden size for the MLPs.",
     )
     depth: int = xax.field(
-        value=5,
+        value=4,
         help="The depth for the MLPs.",
     )
     num_mixtures: int = xax.field(
@@ -94,9 +94,9 @@ class VelocityCommandMarker(ksim.vis.Marker):
     """
 
     command_name: str = attrs.field()
-    radius: float = attrs.field(default=0.08)
+    radius: float = attrs.field(default=0.05)
     size: float = attrs.field(default=0.04)
-    arrow_len: float = attrs.field(default=0.3)
+    arrow_len: float = attrs.field(default=0.5)
     height: float = attrs.field(default=0.6)
 
     def update(self, trajectory: ksim.Trajectory) -> None:
@@ -175,8 +175,8 @@ class VelocityCommand(ksim.Command):
     categories: tuple[str, ...] = ("stand", "sagittal", "lateral", "rotate", "omni")
     NUM_CATS: int = len(categories)
     # sampling ranges
-    x_range: tuple[float, float] = (-0.5, 2.0)
-    y_range: tuple[float, float] = (-0.5, 0.5)
+    x_range: tuple[float, float] = (-0.3, 1.0)
+    y_range: tuple[float, float] = (-0.3, 0.3)
     yaw_range: tuple[float, float] = (-0.5, 0.5)
 
     # timing
@@ -300,6 +300,101 @@ class BentArmPenalty(JointPositionPenalty):
 
 
 @attrs.define(frozen=True, kw_only=True)
+class FollowVelocityXYReward(ksim.Reward):
+    """Reward for tracking the commanded body-frame linear velocity in the X-Y plane.
+
+    implementes reward as a per this paper: https://arxiv.org/pdf/2407.05148
+
+    """
+
+    error_scale: float = attrs.field(default=0.1)
+    """`k` in the equations above."""
+    command_name: str = attrs.field(default="velocity_command")
+    standing_thresh: float = attrs.field(default=1e-4)
+
+    # ----------------------------------------------------------------------------------
+    def _linear_velocity_body(self, traj: ksim.Trajectory) -> Array:
+        linvel_world = traj.qvel[..., :3]
+        linvel_body = xax.rotate_vector_by_quat(linvel_world, traj.qpos[..., 3:7], inverse=True)
+        return linvel_body[..., :2]  # X, Y components only
+
+    # ----------------------------------------------------------------------------------
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        """Compute the velocity-tracking reward.
+
+        The reward follows the formulation from the referenced paper:
+
+            r = 3 * exp( - ((ẋ_in - ẋ_base)^2 + (ẏ_in - ẏ_base)^2) / sigma )
+
+        where sigma is a scaling/temperature parameter controlling the sharpness
+        of the exponential.  In code we re-use ``self.error_scale`` as this sigma.
+
+        A value of 3.0 is applied so that the maximum achievable reward (when
+        the commanded velocity is perfectly tracked) is 3.  No special case
+        for *standing* is required anymore - the above expression naturally
+        returns the maximum reward when both commanded and actual velocities
+        are zero.
+        """
+
+        # Commanded body-frame velocity (cx, cy).
+        cmd_xy = trajectory.command[self.command_name][..., :2]
+
+        # Actual body-frame COM velocity (vx, vy).
+        vel_xy_body = self._linear_velocity_body(trajectory)
+
+        # Squared error in the horizontal plane.
+        err_xy = vel_xy_body - cmd_xy
+        err_sq_sum = jnp.square(err_xy).sum(axis=-1)
+
+        # Exponential tracking reward.
+        reward = 3.0 * jnp.exp(-(err_sq_sum) / self.error_scale)
+
+        return reward
+
+    # ----------------------------------------------------------------------------------
+    def get_name(self) -> str:
+        return "follow_instructed_xy"
+        
+
+@attrs.define(frozen=True, kw_only=True)
+class FollowYawOrientationReward(ksim.Reward):
+    """Reward for tracking the commanded yaw angular velocity (yaw rate).
+
+    Uses an exponential penalty on the error between the robot's current yaw
+    angular velocity and the commanded yaw rate. This is consistent with the
+    velocity-based nature of the X-Y commands.
+    """
+
+    error_scale: float = attrs.field(default=0.5)
+    command_name: str = attrs.field(default="velocity_command")
+
+    # ----------------------------------------------------------------------------------
+    def _angular_velocity_body(self, traj: ksim.Trajectory) -> Array:
+        angvel_world = traj.qvel[..., 3:6]
+        angvel_body = xax.rotate_vector_by_quat(angvel_world, traj.qpos[..., 3:7], inverse=True)
+        return angvel_body
+
+    # ----------------------------------------------------------------------------------
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        # Current yaw angular velocity in body frame
+        yaw_rate_curr = self._angular_velocity_body(trajectory)[..., 2]
+
+        # Commanded yaw rate (third component is yaw angular velocity)
+        yaw_rate_cmd = trajectory.command[self.command_name][..., 2]
+
+        # Error between commanded and actual yaw rate
+        yaw_rate_error = yaw_rate_curr - yaw_rate_cmd
+
+        # Reward formula: 3 * exp(- (error^2) / sigma )
+        reward = 3.0 * jnp.exp(-jnp.square(yaw_rate_error) / self.error_scale)
+
+        return reward
+
+    # ----------------------------------------------------------------------------------
+    def get_name(self) -> str:
+        return "follow_instructed_yaw_rate"
+
+@attrs.define(frozen=True, kw_only=True)
 class StraightLegPenalty(JointPositionPenalty):
     @classmethod
     def create_penalty(
@@ -334,10 +429,124 @@ class ActionRatePenalty(ksim.Reward):
         # Mask out steps immediately following termination.
         done = jnp.pad(trajectory.done[..., :-1], ((1, 0),), mode="edge")[..., None]
 
+        # Difference between successive action vectors.
         action_rate = jnp.where(done, 0.0, actions_zp[..., 1:, :] - actions_zp[..., :-1, :])
-        # Mean over action dimensions; choose your favourite norm (l1/l2 etc.).
-        penalty = xax.get_norm(action_rate, self.norm).mean(axis=-1)
+
+        # r7 formulation: sum of squared differences across all action dims.
+        penalty = jnp.sum(jnp.square(action_rate), axis=-1)
+
         return penalty
+
+
+# --------------------------------------------------------------------------------------
+# Stand-still pose penalty (r8) – encourage default posture when idle.
+# --------------------------------------------------------------------------------------
+
+
+@attrs.define(frozen=True, kw_only=True)
+class StandStillPosePenalty(ksim.Reward):
+    """Penalty for deviating from the default pose when velocity command is ~0.
+
+    Only active when the commanded velocity magnitude is below `vel_thresh`.
+
+    r = Σ |q – q_default|   (applied only if stand-still)
+    The negative scaling (e.g. ‑0.5) is supplied when instantiating the reward.
+    """
+
+    joint_indices: tuple[int, ...] = attrs.field()
+    joint_targets: tuple[float, ...] = attrs.field()
+    command_name: str = attrs.field(default="velocity_command")
+    vel_thresh: float = attrs.field(default=0.1)  # threshold on √(cx² + cy² + ψ²)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        # Commanded linear velocities (cx, cy, cyaw)
+        cmd_vec = trajectory.command[self.command_name][..., :3]
+
+        # Stand-still condition: *all* components are (near) zero.
+        is_standing = jnp.all(jnp.abs(cmd_vec) < 1e-6, axis=-1)
+
+        # Deviation from default pose (L1 norm across selected joints).
+        qpos = trajectory.qpos[..., jnp.array(self.joint_indices) + 7]
+        diff_l1 = jnp.abs(qpos - jnp.array(self.joint_targets)).sum(axis=-1)
+
+        penalty = jnp.where(is_standing, diff_l1, 0.0)
+        return penalty
+
+    # --------------------------------------------
+    @classmethod
+    def create_penalty(
+        cls,
+        physics_model: ksim.PhysicsModel,
+        *,
+        scale: float = -0.5,
+        scale_by_curriculum: bool = False,
+    ) -> "StandStillPenalty":
+        # Use default pose from ZEROS for the lower-body joints.
+        default_dict = {k: v for k, v in ZEROS}
+        leg_joint_names = [
+            "dof_right_hip_pitch_04",
+            "dof_right_hip_roll_03",
+            "dof_right_hip_yaw_03",
+            "dof_right_knee_04",
+            "dof_right_ankle_02",
+            "dof_left_hip_pitch_04",
+            "dof_left_hip_roll_03",
+            "dof_left_hip_yaw_03",
+            "dof_left_knee_04",
+            "dof_left_ankle_02",
+        ]
+
+        # Map joint names to qpos indices.
+        from ksim.utils.mujoco import get_qpos_data_idxs_by_name  # local import to avoid circular
+
+        joint_to_idx = get_qpos_data_idxs_by_name(physics_model)
+        joint_indices = tuple(int(joint_to_idx[name][0]) - 7 for name in leg_joint_names)
+        joint_targets = tuple(default_dict[name] for name in leg_joint_names)
+
+        return cls(
+            joint_indices=joint_indices,
+            joint_targets=joint_targets,
+            scale=scale,
+            scale_by_curriculum=scale_by_curriculum,
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Torque penalty – encourages energy-efficient, smooth motion.
+# --------------------------------------------------------------------------------------
+
+
+@attrs.define(frozen=True, kw_only=True)
+class TorquePenalty(ksim.Reward):
+    """Penalty for high actuator torques (control efforts).
+
+    Implements the formulation from the referenced paper:
+
+        r = -0.0002 * sqrt( Σ τ²  +  Σ |τ| )
+
+    where τ is the vector of actuator torques.  We retrieve τ from the
+    ``actuator_force_observation`` stored inside the trajectory's observation
+    dict.  The reward itself returns the **positive** square–root term; the
+    negative scaling (‐0.0002) is supplied via the *scale* parameter when the
+    reward is instantiated so that sign-checking logic in the reward base
+    class remains consistent.
+    """
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:  # noqa: D401 – simple enough
+        # Actuator forces/torques as recorded by the observation pipeline.
+        if "actuator_force_observation" not in trajectory.obs:
+            raise ValueError("'actuator_force_observation' missing from trajectory observations – make sure the\n"
+                             "ksim.ActuatorForceObservation is enabled in get_observations().")
+
+        tau = trajectory.obs["actuator_force_observation"]  # (..., num_actuators)
+
+        # L2 component: sum of squares, L1 component: sum of absolutes.
+        l2_term = jnp.sum(jnp.square(tau), axis=-1)
+        l1_term = jnp.sum(jnp.abs(tau), axis=-1)
+
+        penalty_mag = jnp.sqrt(l2_term + l1_term)  # positive quantity
+
+        return penalty_mag
 
 
 class Actor(eqx.Module):
@@ -624,23 +833,16 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             # Standard rewards.
-            ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
-            # ksim.StayAliveReward(scale=1.0),
             ksim.UprightReward(scale=0.5),
             # Avoid movement penalties.
-            # ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
-            # ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
-            # Normalization penalties.
-            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            # ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
+            FollowVelocityXYReward(scale=1.0),
+            FollowYawOrientationReward(scale=1.0),
+            TorquePenalty(scale=-0.0002), # this has a lower value to make sure it is on the same scale as the other rewards
+            ActionRatePenalty(scale=-0.01),  # promotes smooth actions (r7)
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
+            StandStillPosePenalty.create_penalty(physics_model, scale=-0.5),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -831,8 +1033,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=2048,
-            batch_size=256,
+            num_envs=8,
+            batch_size=2,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
